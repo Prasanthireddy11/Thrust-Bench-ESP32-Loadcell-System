@@ -1,0 +1,149 @@
+#include <ESP32Servo.h>
+#include "HX711.h"
+#include "max6675.h"
+#include <SoftwareSerial.h>
+
+// --- Constants ---
+#define ESC_PIN         5
+#define IR_SENSOR_PIN   14
+#define SCK_PIN         3
+#define DOUT1           2
+#define DOUT2           4
+#define DOUT3           6
+#define VVM_RX          16
+#define VVM_TX          17
+#define THERMO_CLK      12
+#define THERMO_CS       11
+#define THERMO_DO       10
+#define ARM_LENGTH      0.049
+#define PULSES_PER_REV  2
+
+// --- Globals ---
+Servo esc;
+volatile int pulseCount = 0;
+volatile unsigned long lastPulseTime = 0;
+int motorSpeed = 0;
+int rpm = 0;
+
+HX711 scale1, scale2, scale3;
+MAX6675 thermocouple(THERMO_CLK, THERMO_CS, THERMO_DO);
+SoftwareSerial vvmSerial(VVM_RX, VVM_TX);
+
+// --- Sensor Values ---
+float thrust_N = 0, torque_Nm = 0;
+float temperature = 0;
+float voltage = 0, current = 0, power = 0;
+float efficiency = 0;
+
+// --- ISR ---
+void IRAM_ATTR rpm_isr() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastPulseTime > 10) {
+    pulseCount++;
+    lastPulseTime = currentTime;
+  }
+}
+
+// --- FreeRTOS Tasks ---
+void MotorControlTask(void *pvParameters) {
+  while (true) {
+    if (Serial.available()) {
+      motorSpeed = Serial.parseInt();
+      if (motorSpeed >= 1000 && motorSpeed <= 2000) {
+        esc.writeMicroseconds(motorSpeed);
+        Serial.print("Motor Speed Set To: ");
+        Serial.println(motorSpeed);
+      }
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+void RPMTask(void *pvParameters) {
+  while (true) {
+    rpm = (pulseCount * 60) / PULSES_PER_REV;
+    pulseCount = 0;
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+void SensorTask(void *pvParameters) {
+  while (true) {
+    float thrust_kg = scale1.get_units(10) / 1000.0;
+    float torque1_kg = scale2.get_units(10) / 1000.0;
+    float torque2_kg = scale3.get_units(10) / 1000.0;
+
+    thrust_N = thrust_kg * 9.81;
+    float netTorqueForce_kg = torque1_kg - torque2_kg;
+    float netTorque_N = netTorqueForce_kg * 9.81;
+    torque_Nm = netTorque_N * ARM_LENGTH;
+
+    temperature = thermocouple.readCelsius();
+
+    if (vvmSerial.available()) {
+      String line = vvmSerial.readStringUntil('\n');
+      line.trim();
+      int commaIndex = line.indexOf(',');
+      if (commaIndex > 0) {
+        voltage = line.substring(0, commaIndex).toFloat();
+        current = line.substring(commaIndex + 1).toFloat();
+      }
+    }
+
+    power = voltage * current;
+    float thrust_g = thrust_kg * 1000.0;
+    efficiency = (power > 0) ? (thrust_g / power) : 0;
+
+    // HX711 power cycle for stability
+    scale1.power_down(); scale2.power_down(); scale3.power_down();
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    scale1.power_up(); scale2.power_up(); scale3.power_up();
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+void PrintTask(void *pvParameters) {
+  while (true) {
+    Serial.println("===== Sensor Readings =====");
+    Serial.print("Thrust: "); Serial.print(thrust_N, 3); Serial.println(" N");
+    Serial.print("Torque: "); Serial.print(torque_Nm, 4); Serial.println(" Nm");
+    Serial.print("RPM: "); Serial.println(rpm);
+    Serial.print("Temperature: "); Serial.print(temperature); Serial.println(" °C");
+    Serial.print("Voltage: "); Serial.print(voltage, 2); Serial.println(" V");
+    Serial.print("Current: "); Serial.print(current, 2); Serial.println(" A");
+    Serial.print("Power: "); Serial.print(power, 2); Serial.println(" W");
+    Serial.print("Efficiency: "); Serial.print(efficiency, 2); Serial.println(" g/W");
+    Serial.println("===========================\n");
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  esc.attach(ESC_PIN, 1000, 2000);
+  esc.write(0);
+  delay(3000);
+
+  pinMode(IR_SENSOR_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(IR_SENSOR_PIN), rpm_isr, FALLING);
+
+  scale1.begin(DOUT1, SCK_PIN); scale1.set_scale(51.082); scale1.tare();
+  scale2.begin(DOUT2, SCK_PIN); scale2.set_scale(51.847); scale2.tare();
+  scale3.begin(DOUT3, SCK_PIN); scale3.set_scale(51.160); scale3.tare();
+
+  vvmSerial.begin(9600);
+
+  Serial.println("System Initialized");
+
+  // --- Create Tasks ---
+  xTaskCreatePinnedToCore(MotorControlTask, "MotorTask", 2048, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(RPMTask, "RPMTask", 1024, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(SensorTask, "SensorTask", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(PrintTask, "PrintTask", 2048, NULL, 1, NULL, 0);
+}
+
+void loop() {
+  // Nothing here! All handled in tasks.
+}
